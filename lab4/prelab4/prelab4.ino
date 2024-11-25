@@ -7,142 +7,133 @@
 #include <SPI.h>
 #include <Arduino_FreeRTOS.h>
 #include <queue.h>
-#define CAN_2515
-// #define CAN_2518FD
-
-// Set SPI CS Pin according to your hardware
-
-#if defined(SEEED_WIO_TERMINAL) && defined(CAN_2518FD)
-// For Wio Terminal w/ MCP2518FD RPi Hat：
-// Channel 0 SPI_CS Pin: BCM 8
-// Channel 1 SPI_CS Pin: BCM 7
-// Interupt Pin: BCM25
-const int SPI_CS_PIN  = BCM8;
-const int CAN_INT_PIN = BCM25;
-#else
-
-// For Arduino MCP2515 Hat:
-// the cs pin of the version after v1.1 is default to D9
-// v0.9b and v1.0 is default D10
-const int SPI_CS_PIN = 9;
-const int CAN_INT_PIN = 2;
-#endif
-
-
-#ifdef CAN_2518FD
-#include "mcp2518fd_can.h"
-mcp2518fd CAN(SPI_CS_PIN); // Set CS pin
-
-// To TEST MCP2518FD CAN2.0 data transfer
-#define MAX_DATA_SIZE 8
-// To TEST MCP2518FD CANFD data transfer, uncomment below lines
-// #undef  MAX_DATA_SIZE
-// #define MAX_DATA_SIZE 64
-
-#endif
-
-#ifdef CAN_2515
+#include "brakeData.h"
 #include "mcp2515_can.h"
-mcp2515_can CAN(SPI_CS_PIN); // Set CS pin
+
+#define CAN_2515
+#define SPI_CS_PIN 9
+#define CAN_INT_PIN 2
 #define MAX_DATA_SIZE 8
-#endif
 
-#define LED_PIN 13
+mcp2515_can CAN(SPI_CS_PIN); // Set CS pin
+QueueHandle_t accel_pedal;
+QueueHandle_t brake_pedal;
+QueueHandle_t mode_switch;
+QueueHandle_t velocity;
+QueueHandle_t accel_input;
+QueueHandle_t driver_display;
+QueueHandle_t logic_out;
 
-int task1();
-int task2();
-int task3();
-QueueHandle_t queue;
-QueueHandle_t mailbox;
+int read_canbus();
+int control_lights();
+int write_display();
+
+const byte warning_on[9] = "ErBrkON_", warning_off[9] = "ErBrkOFF";
+uint32_t id;
+uint8_t  light_status, high_val = 1, low_val = 0, logic_val, mode_val, accel_in_val, len, q_point = 0, type; // bit0: ext, bit1: rtr
+uint16_t accel_val, shifting_val, brake_val, vel_reading[2], vel_val[2] = {0}, vel_val_prev[2] = {0};
+byte cdata[MAX_DATA_SIZE] = {0};
+
 
 void setup() {
-    SERIAL_PORT_MONITOR.begin(115200);
-    while (!SERIAL_PORT_MONITOR) {}
+  SERIAL_PORT_MONITOR.begin(115200);
+  while (!SERIAL_PORT_MONITOR) {}
 
-    while (CAN_OK != CAN.begin(CAN_500KBPS)) {             // init can bus : baudrate = 500k
-        SERIAL_PORT_MONITOR.println(F("CAN init fail, retry..."));
-        delay(100);
-    }
-    SERIAL_PORT_MONITOR.println(F("CAN init ok!"));
+  while (CAN_OK != CAN.begin(CAN_500KBPS)) {             // init can bus : baudrate = 500k
+    SERIAL_PORT_MONITOR.println(F("CAN init fail, retry..."));
+    delay(100);
+  }
+  SERIAL_PORT_MONITOR.println(F("CAN init ok!"));
 
-    queue = xQueueCreate(10, sizeof(uint8_t)*MAX_DATA_SIZE);
-    mailbox = xQueueCreate(1, sizeof(uint8_t)*MAX_DATA_SIZE);
+  accel_pedal = xQueueCreate(1, sizeof(uint16_t));
+  brake_pedal = xQueueCreate(1, sizeof(uint16_t));
+  mode_switch = xQueueCreate(1, sizeof(uint8_t));
+  velocity = xQueueCreate(5, sizeof(uint16_t)*2);
+  accel_input = xQueueCreate(1, sizeof(uint8_t));
+  driver_display = xQueueCreate(1, sizeof(uint8_t)*8);
+  logic_out = xQueueCreate(1, sizeof(uint8_t));
 
-    if (queue!=NULL) {
-      xTaskCreate(task1, "task1", 128, NULL, 0, NULL);
-      xTaskCreate(task2, "task2", 128, NULL, 0, NULL);
-      xTaskCreate(task3, "task3", 128, NULL, 0, NULL);
-    }
+  if(accel_pedal != NULL && brake_pedal != NULL && mode_switch != NULL && 
+     velocity != NULL && accel_input != NULL && driver_display != NULL && logic_out != NULL) {
+    xTaskCreate(read_canbus, "read_messages", 128, NULL, 0, NULL);
+    xTaskCreate(control_lights, "control_lights", 128, NULL, 0, NULL);
+    xTaskCreate(write_display, "write_messages", 128, NULL, 0, NULL);
+  }
 }
 
-uint32_t id;
-uint8_t  type; // bit0: ext, bit1: rtr
-uint8_t  len;
-byte cdata[MAX_DATA_SIZE] = {0};
-byte cdata2[MAX_DATA_SIZE] = {0};
-byte cdata3[MAX_DATA_SIZE] = {0};
-uint8_t q_point = 0;
-
-void task1(void* args) {
-  int i, n;
+void read_canbus(void* args) {
   while(1) {
     CAN.readMsgBuf(&len, cdata);
     id = CAN.getCanId();
-    if (id == 0x2) {
-      xQueueOverwrite(queue, &cdata);
+    switch(id) {
+      case CAN_ID_ACCEL_PEDAL:
+        // Combine the lower 16 bits into a single value for the queue.
+        shifting_val = (((uint16_t) cdata[1] & 0xFF) << 8) | cdata[0] & 0xFF;
+        xQueueOverwrite(accel_pedal, &shifting_val);
+        break;
+      case CAN_ID_BRAKE_PEDAL:
+        // Combine the lower 16 bits into a single value for the queue.
+        shifting_val = (((uint16_t) cdata[1] & 0xFF) << 8) | cdata[0] & 0xFF;
+        xQueueOverwrite(brake_pedal, &shifting_val);
+        break;
+      case CAN_ID_MODE_SWITCH:
+        xQueueOverwrite(mode_switch, &cdata);
+        break;
+      case CAN_ID_VELOCITY:
+        vel_reading[0] = (((uint16_t) cdata[1] & 0xFF) << 8) | cdata[0] & 0xFF;
+        vel_reading[1] = millis();
+        // Combine the lower 16 bits into a single value for the queue.
+        xQueueOverwrite(velocity, &vel_reading);
+        break;
+      case CAN_ID_SET_SIGNAL:
+        xQueueOverwrite(accel_input, &cdata);
+        break;
+      default:
+        break;
     }
   }
 }
 
-void task2(void* args) {
-  int i, n;
-  char prbuf[32 + MAX_DATA_SIZE * 3];
+uint16_t calc_accel(uint16_t* cur, uint16_t* prev) {
+  return (abs(cur[0] - prev[0])/(abs(cur[1] - prev[1])*1000));
+}
+
+void control_lights(void* args) {
   while(1) {
-    if(xQueueReceive(queue, &cdata2, portMAX_DELAY)) {
-      for (i = 0; i < 8; i++) {
-        n += sprintf(prbuf + n, "%02X ", cdata2[i]);
-      }
-      n = 0;
-      SERIAL_PORT_MONITOR.println(prbuf);
-      xQueueOverwrite(mailbox, &cdata2);
+    vel_val_prev[0] = vel_val[0];
+    vel_val_prev[1] = vel_val[1];
+    xQueueReceive(accel_pedal, &accel_val, portMAX_DELAY);
+    xQueueReceive(brake_pedal, &brake_val, portMAX_DELAY);
+    xQueueReceive(mode_switch, &mode_val, portMAX_DELAY);
+    xQueueReceive(velocity, &vel_val, portMAX_DELAY);
+    xQueueReceive(accel_input, &accel_in_val, portMAX_DELAY);
+
+    // All the logic from the Simulink model.
+    if (
+      (brake_val > 0) ||
+      (mode_val == ONE_PEDAL_MODE && accel_val <= ACCEL_THRESHOLD) ||
+      (accel_in_val >= 1.3 && vel_val_prev[1] != 0 && calc_accel(vel_val, vel_val_prev) >= 1.3)
+    ) {
+      xQueueOverwrite(logic_out, &high_val);
+      digitalWrite(LED_BUILTIN, HIGH);
+    } else {
+      xQueueOverwrite(logic_out, &low_val);
+      digitalWrite(LED_BUILTIN, LOW);
     }
   }
 }
 
-void task3(void* args) {
+void write_display(void* args) {
   while(1) {
-    if(xQueueReceive(mailbox, &cdata3, portMAX_DELAY)) {
-      if (cdata3[0] > 100) {
-        digitalWrite(LED_BUILTIN, HIGH);
-      } else {
-        digitalWrite(LED_BUILTIN, LOW);
+    if(xQueueReceive(logic_out, &logic_val, portMAX_DELAY)) {
+      light_status = digitalRead(LED_BUILTIN);
+      if (logic_val && !light_status) {
+        CAN.sendMsgBuf(CAN_ID_DRIVER_DISP, CAN_STDID, 8, warning_off);
+      } else if (!logic_val && light_status) {
+        CAN.sendMsgBuf(CAN_ID_DRIVER_DISP, CAN_STDID, 8, warning_on);
       }
     }
   }
 }
 
-void loop() {
-//    // check if data coming
-//    if (CAN_MSGAVAIL != CAN.checkReceive()) {
-//        return;
-//    }
-//
-//    char prbuf[32 + MAX_DATA_SIZE * 6];
-//    int i, n;
-//
-//    unsigned long t = millis();
-//    // read data, len: data length, buf: data buf
-//    CAN.readMsgBuf(&len, cdata);
-//
-//    id = CAN.getCanId();
-//    if (id == 0x1) {
-//      for (i = 0; i < len; i++) {
-//        n += sprintf(prbuf + n, "%02X ", cdata[i]);
-//        cdata[i] = (cdata[i] >> 4) | ((cdata[i] & 0xF) << 4);
-//        n += sprintf(prbuf + n, "%02X ", cdata[i]);
-//      }
-//      CAN.sendMsgBuf(0x5, CAN_STDID, len, cdata);
-//      n = 0;
-//      SERIAL_PORT_MONITOR.println(prbuf);
-//    }
-}
+void loop() {}
