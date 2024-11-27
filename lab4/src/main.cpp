@@ -9,6 +9,7 @@
 #include <queue.h>
 #include "brakeData.h"
 #include "mcp2515_can.h"
+#include "pins_arduino.h"
 
 #define CAN_2515
 #define SPI_CS_PIN 9
@@ -31,7 +32,7 @@ void write_display(void* args);
 const byte warning_on[9] = "ErBrkON_", warning_off[9] = "ErBrkOFF";
 uint32_t id;
 uint8_t  light_status, high_val = 1, low_val = 0, logic_val, mode_val, accel_in_val, len, q_point = 0, type; // bit0: ext, bit1: rtr
-uint16_t accel_val, shifting_val, brake_val, vel_reading[2], vel_val[2] = {0}, vel_val_prev[2] = {0};
+uint16_t accel_val, shifting_val, brake_val;
 byte cdata[MAX_DATA_SIZE] = {0};
 
 
@@ -39,7 +40,6 @@ struct Velocity {
     uint16_t val;
     unsigned long t;
 };
-Velocity vel_last = {0}, vel_cur = {0};
 
 union Type {
     struct {
@@ -74,7 +74,9 @@ void setup() {
     xTaskCreate(read_canbus, "read_messages", 128, NULL, 0, NULL);
     xTaskCreate(control_lights, "control_lights", 128, NULL, 0, NULL);
     xTaskCreate(write_display, "write_messages", 128, NULL, 0, NULL);
+    SERIAL_PORT_MONITOR.println(F("Created Tasks"));
   }
+  SERIAL_PORT_MONITOR.println(F("Completed Setup"));
 }
 
 // Combine the lower 16 bits into a single value for the queue.
@@ -114,25 +116,25 @@ void read_canbus(void* args) {
   }
 }
 
-uint16_t calc_accel(uint16_t* cur, uint16_t* prev) {
-  return (abs(cur[0] - prev[0])/(abs(cur[1] - prev[1])*1000));
+uint16_t calc_accel(Velocity cur, Velocity prev) {
+  return (abs(cur.val - prev.val)/(abs(cur.t - prev.t)*1000));
 }
 
 void control_lights(void* args) {
+  Velocity vel_last = {0}, vel_cur = {0};
   while(1) {
-    vel_val_prev[0] = vel_val[0];
-    vel_val_prev[1] = vel_val[1];
-    xQueueReceive(accel_pedal, &accel_val, portMAX_DELAY);
-    xQueueReceive(brake_pedal, &brake_val, portMAX_DELAY);
-    xQueueReceive(mode_switch, &mode_val, portMAX_DELAY);
-    xQueueReceive(velocity, &vel_val, portMAX_DELAY);
-    xQueueReceive(accel_input, &accel_in_val, portMAX_DELAY);
+    vel_last = vel_cur;
+    xQueuePeek(accel_pedal, &accel_val, portMAX_DELAY);
+    xQueuePeek(brake_pedal, &brake_val, portMAX_DELAY);
+    xQueuePeek(mode_switch, &mode_val, portMAX_DELAY);
+    xQueuePeek(velocity, &vel_cur, portMAX_DELAY);
+    xQueuePeek(accel_input, &accel_in_val, portMAX_DELAY);
 
     // All the logic from the Simulink model.
     if (
       (brake_val > 0) ||
       (mode_val == ONE_PEDAL_MODE && accel_val <= ACCEL_THRESHOLD) ||
-      (accel_in_val >= 1.3 && vel_val_prev[1] != 0 && calc_accel(vel_val, vel_val_prev) >= 1.3)
+      (accel_in_val >= 1.3 && vel_last.t != 0 && calc_accel(vel_cur, vel_last) >= 1.3)
     ) {
       xQueueOverwrite(logic_out, &high_val);
       digitalWrite(LED_BUILTIN, HIGH);
