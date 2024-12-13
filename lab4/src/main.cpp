@@ -5,11 +5,12 @@
  * Copyright (C) 2020 Seeed Technology Co.,Ltd.
  */
 #include <SPI.h>
-//#include <Arduino_FreeRTOS.h>
-//#include <queue.h>
+#include <Arduino_FreeRTOS.h>
+#include <queue.h>
 #include "Arduino.h"
+#include "FreeRTOSVariant.h"
 #include "brakeData.h"
-//#include "mcp2515_can.h"
+#include "mcp2515_can.h"
 #include "pins_arduino.h"
 
 #define CAN_2515
@@ -17,7 +18,7 @@
 #define CAN_INT_PIN 2
 #define MAX_DATA_SIZE 8
 
-/*mcp2515_can CAN(SPI_CS_PIN); // Set CS pin
+mcp2515_can CAN(SPI_CS_PIN); // Set CS pin
 QueueHandle_t accel_pedal;
 QueueHandle_t brake_pedal;
 QueueHandle_t mode_switch;
@@ -25,7 +26,6 @@ QueueHandle_t velocity;
 QueueHandle_t accel_input;
 QueueHandle_t driver_display;
 QueueHandle_t logic_out;
-*/
 void read_canbus(void* args);
 void control_lights(void* args);
 void write_display(void* args);
@@ -52,14 +52,18 @@ uint8_t : 6;
 };
 
 
+#define READ_CANBUS_PIN 12
+#define WRITE_DISP_PIN 11
+#define WRITE_LIGHTS_PIN 10
 void setup() {
     SERIAL_PORT_MONITOR.begin(115200);
     while (!SERIAL_PORT_MONITOR) {}
     
-    pinMode(12, OUTPUT);
-    pinMode(A13, OUTPUT);
+    pinMode(READ_CANBUS_PIN, OUTPUT);
+    pinMode(WRITE_DISP_PIN, OUTPUT);
+    pinMode(WRITE_LIGHTS_PIN, OUTPUT);
 
-    /*while (CAN_OK != CAN.begin(CAN_500KBPS)) {             // init can bus : baudrate = 500k
+    while (CAN_OK != CAN.begin(CAN_500KBPS)) {             // init can bus : baudrate = 500k
       SERIAL_PORT_MONITOR.println(F("CAN init fail, retry..."));
       delay(100);
       }
@@ -80,9 +84,9 @@ void setup() {
       xTaskCreate(write_display, "write_messages", 128, NULL, 0, NULL);
       SERIAL_PORT_MONITOR.println(F("Created Tasks"));
       }
-      SERIAL_PORT_MONITOR.println(F("Completed Setup"));*/
+      SERIAL_PORT_MONITOR.println(F("Completed Setup"));
 }
-/*
+
 // Combine the lower 16 bits into a single value for the queue.
 inline uint16_t combine_bytes(const uint8_t msb, const uint8_t lsb) {
     return (uint16_t)(msb << 8) | lsb;
@@ -91,6 +95,10 @@ inline uint16_t combine_bytes(const uint8_t msb, const uint8_t lsb) {
 void read_canbus(void* args) {
     Velocity vel = {0};
     while(1) {
+        //taskENTER_CRITICAL();
+        //digitalWrite(READ_CANBUS_PIN, HIGH);
+        //SERIAL_PORT_MONITOR.println("ON");
+        //delay(500);
         CAN.readMsgBuf(&len, cdata);
         id = CAN.getCanId();
         switch(id) {
@@ -118,16 +126,32 @@ void read_canbus(void* args) {
             default:
                 break;
         }
+        //digitalWrite(READ_CANBUS_PIN, LOW);
+        //SERIAL_PORT_MONITOR.println("OFF");
+        //delay(500);
+        //taskEXIT_CRITICAL();
+        //delay(10);
     }
 }
 
-uint16_t calc_accel(Velocity cur, Velocity prev) {
-    return (abs(cur.val - prev.val)/(abs(cur.t - prev.t)*1000));
+float calc_accel(Velocity cur, Velocity prev) {
+    return ((float)abs(cur.val - prev.val)/(abs(cur.t - prev.t)*1000));
 }
 
 void control_lights(void* args) {
     Velocity vel_last = {0}, vel_cur = {0};
     while(1) {
+        Velocity tmp = {5, millis()};
+        uint8_t dummy = 0xFF;
+        uint16_t dummy2 = 0xFF00;
+        xQueueOverwrite(accel_pedal, &dummy2);
+        xQueueOverwrite(brake_pedal, &dummy2);
+        xQueueOverwrite(mode_switch, &dummy);
+        xQueueOverwrite(velocity, &tmp);
+        xQueueOverwrite(accel_input, &dummy);
+
+        //taskENTER_CRITICAL();
+        //digitalWrite(WRITE_LIGHTS_PIN, HIGH);
         vel_last = vel_cur;
         xQueuePeek(accel_pedal, &accel_val, portMAX_DELAY);
         xQueuePeek(brake_pedal, &brake_val, portMAX_DELAY);
@@ -139,7 +163,7 @@ void control_lights(void* args) {
         if (
                 (brake_val > 0) ||
                 (mode_val == ONE_PEDAL_MODE && accel_val <= ACCEL_THRESHOLD) ||
-                (accel_in_val >= 1.3 && vel_last.t != 0 && calc_accel(vel_cur, vel_last) >= 1.3)
+                (accel_in_val >= 1.3 && vel_last.t != vel_cur.t && calc_accel(vel_cur, vel_last) >= 1.3)
            ) {
             xQueueOverwrite(logic_out, &high_val);
             digitalWrite(LED_BUILTIN, HIGH);
@@ -147,12 +171,16 @@ void control_lights(void* args) {
             xQueueOverwrite(logic_out, &low_val);
             digitalWrite(LED_BUILTIN, LOW);
         }
+        //digitalWrite(WRITE_LIGHTS_PIN, LOW);
+        //taskEXIT_CRITICAL();
     }
 }
 
 void write_display(void* args) {
     while(1) {
-        if(xQueueReceive(logic_out, &logic_val, portMAX_DELAY)) {
+        taskENTER_CRITICAL();
+        digitalWrite(WRITE_DISP_PIN, HIGH);
+        if(xQueuePeek(logic_out, &logic_val, portMAX_DELAY)) {
             light_status = digitalRead(LED_BUILTIN);
             if (logic_val && !light_status) {
                 CAN.sendMsgBuf(CAN_ID_DRIVER_DISP, CAN_STDID, 8, warning_off);
@@ -160,12 +188,14 @@ void write_display(void* args) {
                 CAN.sendMsgBuf(CAN_ID_DRIVER_DISP, CAN_STDID, 8, warning_on);
             }
         }
+        digitalWrite(WRITE_DISP_PIN, LOW);
+        taskEXIT_CRITICAL();
+        delay(10);
     }
 }
-*/
 void loop() {
-    digitalWrite(12, HIGH);
+    /*digitalWrite(12, HIGH);
     delay(100);
     digitalWrite(12, LOW);
-    delay(50);
+    delay(50);*/
 }
